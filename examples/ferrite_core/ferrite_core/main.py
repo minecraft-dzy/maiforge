@@ -21,8 +21,13 @@ import threading
 import logging
 from typing import Any, Optional
 
-# Use root logger so output is visible
-logger = logging.getLogger("maiforge.ferrite_core")
+# Use root logger so output is visible - set propagate to ensure console output
+logger = logging.getLogger("ferrite_core")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+    logger.addHandler(_h)
 
 # ============================================================
 # 配置
