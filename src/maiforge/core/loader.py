@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import zipfile
 import logging
-from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, Optional
 
