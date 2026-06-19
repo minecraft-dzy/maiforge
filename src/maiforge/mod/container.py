@@ -49,35 +49,46 @@ class ModContainer:
 
     def load(self) -> None:
         self._zip = zipfile.ZipFile(self.zip_path, "r")
-        # Import the entry module from inside the zip
-        # We inject the zip into sys.path so imports work
-        import sys
-        sys.path.insert(0, str(self.zip_path))
+
+        # Resolve entrypoint: "ferrite_core.main" → ("ferrite_core", "main")
+        parts = self.info.entrypoint.rsplit(".", 1)
+        if len(parts) == 2:
+            pkg_name, mod_name = parts
+        else:
+            pkg_name = self.info.entrypoint
+            mod_name = "__init__"
+
+        # Try zipimport first (most reliable)
+        import zipimport
         try:
-            spec = importlib.util.find_spec(
-                self.info.entrypoint.replace(".", "/") + ".py"
-            )
-            if spec is None:
-                # Fallback: load by scanning zip contents
+            importer = zipimport.zipimporter(str(self.zip_path))
+            self._entry_module = importer.load_module(pkg_name)
+        except zipimport.ZipImportError:
+            # Fallback: add to sys.path and try importlib
+            import sys
+            sys.path.insert(0, str(self.zip_path))
+            try:
+                import importlib
+                self._entry_module = importlib.import_module(
+                    self.info.entrypoint.replace("/", ".")
+                )
+            except ImportError:
+                # Last resort: exec source from zip
                 entry_path = self.info.entrypoint.replace(".", "/") + ".py"
                 try:
-                    self._zip.getinfo(entry_path)
-                    # Use zipimport
-                    import zipimport
-                    importer = zipimport.zipimporter(str(self.zip_path))
-                    self._entry_module = importer.load_module(
-                        self.info.entrypoint.split(".")[0]
-                    )
+                    source = self._zip.read(entry_path).decode("utf-8")
+                    mod = type(sys)("ferrite_mod")
+                    mod.__file__ = str(self.zip_path)
+                    exec(compile(source, entry_path, "exec"), mod.__dict__)
+                    self._entry_module = mod
                 except KeyError:
                     raise ImportError(
                         f"Entrypoint {self.info.entrypoint} not found in {self.zip_path}"
                     )
-            else:
-                self._entry_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(self._entry_module)  # type: ignore[union-attr]
-            self._state = "loaded"
-        finally:
-            sys.path.pop(0)
+            finally:
+                sys.path.pop(0)
+
+        self._state = "loaded"
 
     def enable(self, forge) -> None:
         """Call the mod's on_enable() if defined."""
