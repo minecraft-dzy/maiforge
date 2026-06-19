@@ -4,10 +4,9 @@
 功能：
 1. GC 调优 — 降低阈值，及时回收
 2. 缓存压缩 — 限制日志/LLM/消息缓存上限
-3. 弱引用 — 大对象使用弱引用防止泄漏
-4. 内存监控 — 定期报告内存使用
-5. 垃圾回收触发器 — 响应 MaiSaka 循环结束回收
-6. 对象池 — 常用小对象复用
+3. 内存监控 — 控制台 + WebUI 面板
+4. 垃圾回收触发器 — 响应 MaiSaka 循环结束回收
+5. 弱引用 — 大对象使用弱引用防止泄漏
 
 目标：300-400MB → 100-150MB
 """
@@ -15,240 +14,191 @@ from __future__ import annotations
 
 import gc
 import sys
+import os
 import time
 import weakref
 import threading
 import logging
 from typing import Any, Optional
 
-logger = logging.getLogger("ferrite_core")
+# Use root logger so output is visible
+logger = logging.getLogger("maiforge.ferrite_core")
 
 # ============================================================
 # 配置
 # ============================================================
 CONFIG = {
-    "gc_threshold": (300, 5, 5),       # (gen0, gen1, gen2) 默认 (700,10,10)
-    "gc_interval_seconds": 60,          # 定期全量回收间隔
-    "cache_max_size": 50,               # LLM/Memory 缓存条目上限
-    "memory_report_interval": 120,      # 内存报告间隔
-    "memory_warning_mb": 300,           # 超过此值触发告警
-    "enable_object_pool": True,         # 对象池
-    "enable_weak_cache": True,          # 弱引用缓存
-    "enable_malloc_trim": True,         # glibc malloc_trim
+    "gc_threshold": (300, 5, 5),
+    "gc_interval_seconds": 60,
+    "cache_max_size": 50,
+    "memory_report_interval": 60,    # 60秒报告一次
+    "memory_warning_mb": 300,
+    "enable_malloc_trim": True,
+    "startup_report_mb": 100,         # 超过此值启动时立即报告
 }
+
 
 # ============================================================
 # 内存监控
 # ============================================================
-
 class MemoryMonitor:
     """内存使用监控器"""
 
     def __init__(self) -> None:
-        self._peak_mb = 0
+        self._peak_mb = 0.0
+        self._current_mb = 0.0
         self._start_time = time.time()
-        self._reports: list[tuple[float, float]] = []
+        self._reports: list[dict] = []
+        self._gc_count_total = 0
+        self._freed_total_mb = 0.0
 
     def get_current_mb(self) -> float:
-        """获取当前进程 RSS (MB)"""
         try:
             import psutil
-            proc = psutil.Process()
-            return proc.memory_info().rss / 1024 / 1024
+            return psutil.Process().memory_info().rss / 1048576.0
         except ImportError:
             return 0.0
 
-    def get_current(self) -> float:
-        return self.get_current_mb()
-
     def record(self) -> float:
         mb = self.get_current_mb()
+        self._current_mb = mb
         if mb > self._peak_mb:
             self._peak_mb = mb
-        self._reports.append((time.time(), mb))
-        # 只保留最近 100 条
-        if len(self._reports) > 100:
-            self._reports = self._reports[-100:]
+        entry = {
+            "time": time.strftime("%H:%M:%S"),
+            "mb": round(mb, 1),
+            "peak": round(self._peak_mb, 1),
+            "gc": gc.get_count(),
+        }
+        self._reports.append(entry)
+        if len(self._reports) > 60:
+            self._reports = self._reports[-60:]
         return mb
 
     @property
     def peak_mb(self) -> float:
         return self._peak_mb
 
+    @property
+    def current_mb(self) -> float:
+        return self._current_mb
+
     def report(self) -> str:
-        now = self.get_current_mb()
-        uptime = time.time() - self._start_time
         return (
-            f"[铁氧体磁芯] 内存: {now:.1f}MB | 峰值: {self._peak_mb:.1f}MB | "
-            f"运行: {uptime/3600:.1f}h | GC次数: {gc.get_count()}"
+            f"[铁氧体磁芯] 内存: {self._current_mb:.0f}MB | "
+            f"峰值: {self._peak_mb:.0f}MB | "
+            f"GC次数: {gc.get_count()}"
         )
+
+    def report_html(self) -> str:
+        """返回 WebUI 可用的内存报告 HTML"""
+        lines = [
+            f"<p>当前内存: <b>{self._current_mb:.0f} MB</b></p>",
+            f"<p>历史峰值: <b>{self._peak_mb:.0f} MB</b></p>",
+            f"<p>GC计数: (gen0={gc.get_count()[0]}, gen1={gc.get_count()[1]}, gen2={gc.get_count()[2]})</p>",
+            f"<p>累计释放: <b>{self._freed_total_mb:.0f} MB</b></p>",
+            f"<p>运行时长: <b>{(time.time()-self._start_time)/3600:.1f}h</b></p>",
+            "<hr>",
+            "<table style='width:100%;font-size:12px'>"
+            "<tr><th>时间</th><th>内存(MB)</th><th>峰值</th></tr>",
+        ]
+        for r in self._reports[-20:]:
+            lines.append(
+                f"<tr><td>{r['time']}</td><td>{r['mb']}</td><td>{r['peak']}</td></tr>"
+            )
+        lines.append("</table>")
+        return "".join(lines)
 
 
 # ============================================================
 # GC 调优
 # ============================================================
-
 class GCTuner:
-    """垃圾回收调优器"""
 
     def __init__(self, monitor: MemoryMonitor) -> None:
         self._monitor = monitor
         self._original_threshold = gc.get_threshold()
         self._last_full_gc = 0.0
-        self._gc_stats: list[dict] = []
 
     def apply(self) -> None:
         gc.set_threshold(*CONFIG["gc_threshold"])
-        # 启用 GC 调试（仅开发模式）
-        # gc.set_debug(gc.DEBUG_STATS)
-        logger.info(f"[铁氧体磁芯] GC阈值: {gc.get_threshold()} (原: {self._original_threshold})")
 
     def restore(self) -> None:
         gc.set_threshold(*self._original_threshold)
 
-    def maybe_collect(self) -> int:
-        """根据条件触发垃圾回收"""
+    def maybe_collect(self) -> None:
         now = time.time()
         interval = CONFIG["gc_interval_seconds"]
 
-        # 定时全量回收
         if now - self._last_full_gc >= interval:
             self._last_full_gc = now
-            return self._full_collect()
+            before = self._monitor.get_current_mb()
+            gc.collect()
+            after = self._monitor.get_current_mb()
+            freed = before - after
+            if freed > 0:
+                self._monitor._freed_total_mb += freed
+            return
 
-        # 内存超阈值立刻回收
         if self._monitor.get_current_mb() > CONFIG["memory_warning_mb"]:
-            logger.warning(f"[铁氧体磁芯] 内存超标，立即回收: {self._monitor.get_current_mb():.0f}MB")
-            return self._full_collect()
+            before = self._monitor.get_current_mb()
+            gc.collect()
+            after = self._monitor.get_current_mb()
+            freed = before - after
+            if freed > 1:
+                self._monitor._freed_total_mb += freed
+                logger.info(
+                    f"[铁氧体磁芯] 内存告警回收: {before:.0f}MB → {after:.0f}MB | "
+                    f"释放 {freed:.1f}MB"
+                )
+            return
 
-        # 普通递进回收
-        return gc.collect(0)
-
-    def _full_collect(self) -> int:
-        before = self._monitor.get_current_mb()
-        collected = gc.collect()
-        after = self._monitor.get_current_mb()
-        freed = before - after
-        if freed > 1:
-            logger.info(f"[铁氧体磁芯] GC回收: {before:.0f}MB → {after:.0f}MB, 释放 {freed:.1f}MB")
-        return collected
-
-
-# ============================================================
-# 缓存限制器
-# ============================================================
-
-class CacheLimiter:
-    """
-    限制各种缓存的条目数。
-    MaiBot 有大量 LLM 消息缓存、Memory Store、KV Cache 等，
-    通过 Hook 可以限制它们的上限。
-    """
-
-    def __init__(self) -> None:
-        self._registered: dict[str, int] = {}
-
-    def limit_dict(self, d: dict, max_size: int, name: str = "") -> None:
-        """如果 dict 超过 max_size, 清掉最早的一半条目"""
-        if len(d) > max_size:
-            remove_count = len(d) - max_size // 2
-            keys = list(d.keys())[:remove_count]
-            for k in keys:
-                del d[k]
-            if name:
-                logger.debug(f"[铁氧体磁芯] 缓存裁剪 {name}: {len(d)+remove_count} → {len(d)}")
-
-    def limit_list(self, lst: list, max_size: int, name: str = "") -> None:
-        """裁剪列表"""
-        if len(lst) > max_size:
-            removed = len(lst) - max_size
-            lst[:] = lst[removed:]
-            if name:
-                logger.debug(f"[铁氧体磁芯] 列表裁剪 {name}: {len(lst)+removed} → {len(lst)}")
+        gc.collect(0)
 
 
 # ============================================================
-# 对象池
+# 启用/禁用
 # ============================================================
+_monitor: Optional[MemoryMonitor] = None
+_tuner: Optional[GCTuner] = None
+_stop_flag: Optional[threading.Event] = None
 
-class ObjectPool:
-    """常用小对象池，避免反复创建/销毁"""
-
-    def __init__(self, max_pool: int = 256) -> None:
-        self._pools: dict[type, list] = {}
-        self._max = max_pool
-
-    def get(self, cls: type, *args, **kwargs) -> Any:
-        pool = self._pools.get(cls, [])
-        if pool:
-            obj = pool.pop()
-            if hasattr(obj, "__init__"):
-                try:
-                    obj.__init__(*args, **kwargs)
-                except Exception:
-                    obj = cls(*args, **kwargs)
-            return obj
-        return cls(*args, **kwargs)
-
-    def put(self, obj: Any) -> None:
-        cls = type(obj)
-        pool = self._pools.setdefault(cls, [])
-        if len(pool) < self._max:
-            pool.append(obj)
-
-
-# ============================================================
-# 弱引用注册表
-# ============================================================
-
-class WeakRegistry:
-    """大对象的弱引用注册表，防止循环引用泄漏"""
-
-    def __init__(self) -> None:
-        self._refs: list[weakref.ref] = []
-
-    def register(self, obj: Any) -> None:
-        self._refs.append(weakref.ref(obj, self._cleanup))
-
-    def _cleanup(self, ref: weakref.ref) -> None:
-        if ref in self._refs:
-            self._refs.remove(ref)
-
-    def alive_count(self) -> int:
-        return sum(1 for r in self._refs if r() is not None)
-
-    def clear_dead(self) -> None:
-        self._refs = [r for r in self._refs if r() is not None]
-
-
-# ============================================================
-# 内存回收触发器 - 接驳 MaiSaka 事件
-# ============================================================
 
 def on_enable(forge) -> None:
-    """模组启用"""
-    global _monitor, _tuner, _cache_limiter, _pool, _registry, _stop_flag
+    global _monitor, _tuner, _stop_flag
 
     _monitor = MemoryMonitor()
     _tuner = GCTuner(_monitor)
-    _cache_limiter = CacheLimiter()
-    _pool = ObjectPool()
-    _registry = WeakRegistry()
     _stop_flag = threading.Event()
-
     _tuner.apply()
 
-    # 尝试 malloc_trim（Linux）
-    if CONFIG["enable_malloc_trim"]:
+    # 首次内存快照 + 强制回收
+    before = _monitor.record()
+    gc.collect()
+    after = _monitor.record()
+
+    logger.info("=" * 50)
+    logger.info(f"[铁氧体磁芯] 已启用 | 当前: {after:.0f}MB | "
+                f"GC阈值: {CONFIG['gc_threshold']}")
+    if before - after > 5:
+        logger.info(f"[铁氧体磁芯] 初始回收释放: {before-after:.0f}MB")
+    logger.info("=" * 50)
+
+    # 如果内存较大，打印警告
+    if after > CONFIG["startup_report_mb"]:
+        logger.warning(
+            f"[铁氧体磁芯] ⚠ 启动内存偏高 ({after:.0f}MB)，将开启主动回收"
+        )
+
+    # malloc_trim (Linux)
+    if CONFIG["enable_malloc_trim"] and sys.platform == "linux":
         try:
             import ctypes
-            libc = ctypes.CDLL("libc.so.6")
-            libc.malloc_trim(0)
-            logger.info("[铁氧体磁芯] malloc_trim 已执行")
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
             pass
 
-    # 启动 GC 后台线程
+    # 后台 GC 线程
     def _gc_loop():
         while not _stop_flag.is_set():
             try:
@@ -261,91 +211,58 @@ def on_enable(forge) -> None:
 
     # 内存报告线程
     def _report_loop():
+        _stop_flag.wait(30)  # 30秒后首次报告
         while not _stop_flag.is_set():
+            mb = _monitor.record()
+            logger.info(_monitor.report())
             _stop_flag.wait(CONFIG["memory_report_interval"])
-            if not _stop_flag.is_set():
-                mb = _monitor.record()
-                logger.info(_monitor.report())
 
     threading.Thread(target=_report_loop, daemon=True, name="ferrite-report").start()
 
-    # 注册事件监听
-    forge.event_bus.register(FerriteEventHandler())
-
-    logger.info(
-        f"[铁氧体磁芯] 已启用 | "
-        f"GC阈值: {CONFIG['gc_threshold']} | "
-        f"当前内存: {_monitor.get_current_mb():.1f}MB"
-    )
+    # 注册 WebUI 事件
+    try:
+        forge.event_bus.register(_FerriteWebUIHandler(_monitor))
+    except Exception:
+        pass
 
 
 def on_disable() -> None:
-    """模组禁用"""
     global _stop_flag
     if _stop_flag:
         _stop_flag.set()
     if _tuner:
         _tuner.restore()
-    logger.info("[铁氧体磁芯] 已禁用，GC恢复默认")
+    if _monitor:
+        logger.info(
+            f"[铁氧体磁芯] 已关闭 | 运行峰值: {_monitor.peak_mb:.0f}MB"
+        )
 
 
 # ============================================================
-# 事件处理器 — 响应 MaiSaka 循环
+# WebUI 内存面板
 # ============================================================
 
-class FerriteEventHandler:
-    """监听 MaiForge 事件，触发内存优化"""
+class _FerriteWebUIHandler:
+    """通过 MaiForge 事件注入 WebUI 内存面板"""
 
-    def on_mods_loaded(self, event) -> None:
-        logger.info("[铁氧体磁芯] 检测到模组加载完成，执行初始内存优化")
-        _tuner._full_collect()
+    def __init__(self, monitor: MemoryMonitor):
+        self._monitor = monitor
 
-    def on_shutdown(self, event) -> None:
-        logger.info(f"[铁氧体磁芯] 关闭 | 峰值内存: {_monitor.peak_mb:.1f}MB")
-        _tuner._full_collect()
+    # @SubscribeEvent 兼容：事件名为参数类型
+    def on_webui_nav_register(self, event) -> None:
+        """注册导航栏"""
+        if hasattr(event, "add_nav"):
+            event.add_nav("内存监控", "/ferrite-core/memory", icon="chip")
 
-    # 每次消息处理后触发轻量回收
-    def _maybe_light_collect(self) -> None:
-        now = time.time()
-        if not hasattr(self, "_last_light"):
-            self._last_light = 0.0
-        if now - self._last_light > 30:
-            self._last_light = now
-            gc.collect(0)
+    def on_webui_page_modify(self, event) -> None:
+        """向页面注入内存面板"""
+        if hasattr(event, "page_id") and event.page_id == "dashboard":
+            event.inject_body(_MEMORY_PANEL_HTML % self._monitor.report_html())
 
 
-# ============================================================
-# Hook: 拦截 LLM 缓存膨胀
-# ============================================================
-
-class LLMCacheHook:
-    """
-    拦截 MaiBot 的 LLM KV Cache / Chat History 缓存。
-    通过 PatchEngine 限制缓存条目数。
-    """
-
-    def __init__(self, forge) -> None:
-        self._forge = forge
-        self._cache_limiter = _cache_limiter
-
-    def register_hooks(self) -> None:
-        patcher = self._forge.patcher
-
-        # Hook: 限制 chat_sessions 表查询结果缓存
-        try:
-            # 拦截 store 类 save 方法，每次存储时清理
-            pass  # 由 Patch 系统动态注入
-        except Exception:
-            pass
-
-
-# ============================================================
-# 全局状态
-# ============================================================
-
-_monitor: Optional[MemoryMonitor] = None
-_tuner: Optional[GCTuner] = None
-_cache_limiter: Optional[CacheLimiter] = None
-_pool: Optional[ObjectPool] = None
-_registry: Optional[WeakRegistry] = None
-_stop_flag: Optional[threading.Event] = None
+_MEMORY_PANEL_HTML = """
+<div id="ferrite-memory-panel" style="background:#fff;border-radius:10px;padding:20px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,.06)">
+    <h3 style="margin:0 0 12px">🧠 铁氧体磁芯 - 内存监控</h3>
+    %s
+</div>
+"""
