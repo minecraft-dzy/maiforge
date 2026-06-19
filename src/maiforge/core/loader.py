@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import zipfile
 import logging
+from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,6 +16,14 @@ from ..mod.container import ModContainer, ModInfo
 from .. import VERSION as MAIFORGE_VERSION
 
 logger = logging.getLogger("maiforge.loader")
+
+
+def _parse_version(ver: str) -> tuple:
+    """Parse semver string into comparable tuple."""
+    try:
+        return tuple(int(x) for x in str(ver).lstrip("v").split(".")[:3])
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
 
 
 class ModLoadingException(Exception):
@@ -79,12 +88,24 @@ class ModLoader:
 
         info = self.validate_manifest(manifest)
 
-        # Check duplicates
+        # Check duplicates — prefer newer version, skip older
         if info.mod_id in self.mods:
-            raise ModLoadingException(
-                f"Duplicate mod id '{info.mod_id}': already loaded from "
-                f"{self.mods[info.mod_id].zip_path.name}"
+            existing = self.mods[info.mod_id]
+            existing_ver = _parse_version(existing.info.version)
+            new_ver = _parse_version(info.version)
+            if new_ver <= existing_ver:
+                logger.warning(
+                    "Skipping %s (v%s): already have newer v%s",
+                    zip_path.name, info.version, existing.info.version,
+                )
+                return None  # skip, don't error
+            # Newer — unload old, load new
+            logger.info(
+                "Replacing %s v%s with v%s",
+                info.mod_id, existing.info.version, info.version,
             )
+            existing.disable()
+            del self.mods[info.mod_id]
 
         container = ModContainer(zip_path, info)
         container.load()
