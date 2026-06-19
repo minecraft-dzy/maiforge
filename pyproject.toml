@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maiforge"
+version = "1.0.0"
+description = "MaiBot Mod Loader – Forge-style modding for MaiBot"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "DZY", email = "minecraft-dzy@users.noreply.github.com" }]
+keywords = ["maibot", "mod", "forge", "loader"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/minecraft-dzy/maiforge"
+Repository = "https://github.com/minecraft-dzy/maiforge"
+Documentation = "https://github.com/minecraft-dzy/maiforge/blob/main/docs/DEVELOPER_GUIDE.md"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["maiforge", "maiforge.core", "maiforge.mod", "maiforge.patch", "maiforge.installer", "maiforge.webui", "maiforge.api"]
