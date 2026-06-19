@@ -1,0 +1,9 @@
+{
+  "modId": "ferrite_core",
+  "name": "铁氧体磁芯",
+  "version": "1.0.0",
+  "author": "DZY",
+  "description": "内存优化模组，优化MaiBot内存占用，大幅降低RAM使用。启用GC调优、缓存压缩、弱引用优化等策略，目标将内存从300-400MB降至150MB以下。",
+  "entrypoint": "ferrite_core.main",
+  "maiforgeApi": "1.0"
+}
